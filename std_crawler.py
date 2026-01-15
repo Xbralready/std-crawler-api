@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-全国标准信息公共服务平台爬虫
-网站: https://std.samr.gov.cn/
+全国标准信息公共服务平台爬虫 v2.0
+新增功能：详情获取、PDF下载链接、批量搜索
 """
 
 import asyncio
 import json
 import csv
-import time
+import re
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict
 from playwright.async_api import async_playwright, Page, Browser
 
 
@@ -21,14 +21,11 @@ class StdCrawler:
 
     BASE_URL = "https://std.samr.gov.cn"
     SEARCH_URL = "https://std.samr.gov.cn/search/std"
+    OPENSTD_URL = "https://openstd.samr.gov.cn"
 
     def __init__(self, headless: bool = True, delay: float = 1.0):
         """
         初始化爬虫
-
-        Args:
-            headless: 是否无头模式运行浏览器
-            delay: 请求间隔时间(秒)，避免被封
         """
         self.headless = headless
         self.delay = delay
@@ -41,7 +38,6 @@ class StdCrawler:
         playwright = await async_playwright().start()
         self.browser = await playwright.chromium.launch(headless=self.headless)
         self.page = await self.browser.new_page()
-        # 设置超时时间
         self.page.set_default_timeout(30000)
         print("浏览器已启动")
 
@@ -51,49 +47,67 @@ class StdCrawler:
             await self.browser.close()
             print("浏览器已关闭")
 
+    async def batch_search(self, keywords: List[str], max_pages: int = 3,
+                           std_type: str = "全部", std_status: str = "全部",
+                           get_details: bool = False) -> List[Dict]:
+        """
+        批量搜索多个关键词
+        """
+        all_results = []
+
+        for i, keyword in enumerate(keywords):
+            print(f"\n[{i+1}/{len(keywords)}] 搜索关键词: {keyword}")
+            results = await self.search(
+                keyword=keyword,
+                max_pages=max_pages,
+                std_type=std_type,
+                std_status=std_status
+            )
+
+            if get_details and results:
+                print(f"正在获取 {len(results)} 条记录的详情...")
+                for j, result in enumerate(results):
+                    if result.get("url"):
+                        print(f"  [{j+1}/{len(results)}] 获取详情: {result.get('std_code', '')}")
+                        detail = await self.get_detail(result["url"])
+                        result.update(detail)
+                        await asyncio.sleep(self.delay * 0.5)
+
+            for result in results:
+                result["search_keyword"] = keyword
+
+            all_results.extend(results)
+
+            if i < len(keywords) - 1:
+                await asyncio.sleep(self.delay)
+
+        self.results = all_results
+        print(f"\n批量搜索完成，共获取 {len(all_results)} 条记录")
+        return all_results
+
     async def search(self, keyword: str, max_pages: int = 5,
                      std_type: str = "全部", std_status: str = "全部") -> list:
-        """
-        搜索标准
-
-        Args:
-            keyword: 搜索关键词
-            max_pages: 最大爬取页数
-            std_type: 标准类型 (全部/国家标准计划/国家标准/行业标准/地方标准)
-            std_status: 标准状态 (全部/现行/废止)
-
-        Returns:
-            搜索结果列表
-        """
+        """搜索标准"""
         self.results = []
 
-        # 构建搜索URL
         search_url = f"{self.SEARCH_URL}?q={keyword}"
         print(f"\n开始搜索: {keyword}")
-        print(f"搜索URL: {search_url}")
 
-        # 访问搜索页面
         await self.page.goto(search_url)
         await self.page.wait_for_load_state("networkidle")
-
-        # 等待iframe加载
         await asyncio.sleep(2)
 
-        # 应用筛选条件
         if std_type != "全部":
             await self._select_filter("标准类型", std_type)
         if std_status != "全部":
             await self._select_filter("标准状态", std_status)
 
-        # 获取总结果数
         total_text = await self._get_total_count()
         print(f"找到结果: {total_text}")
 
-        # 爬取每一页
         for page_num in range(1, max_pages + 1):
             print(f"\n--- 正在爬取第 {page_num} 页 ---")
 
-            # 解析当前页结果
             page_results = await self._parse_search_results()
 
             if not page_results:
@@ -103,15 +117,11 @@ class StdCrawler:
             self.results.extend(page_results)
             print(f"本页获取 {len(page_results)} 条记录")
 
-            # 检查是否有下一页
             has_next = await self._has_next_page()
             if not has_next or page_num >= max_pages:
                 break
 
-            # 点击下一页
             await self._goto_next_page()
-
-            # 随机延迟，避免被封
             delay = self.delay + random.uniform(0, 1)
             await asyncio.sleep(delay)
 
@@ -121,7 +131,6 @@ class StdCrawler:
     async def _select_filter(self, filter_name: str, value: str):
         """选择筛选条件"""
         try:
-            # 点击对应的筛选选项
             selector = f'text="{value}"'
             await self.page.click(selector)
             await asyncio.sleep(1)
@@ -131,7 +140,6 @@ class StdCrawler:
     async def _get_total_count(self) -> str:
         """获取搜索结果总数"""
         try:
-            # 等待iframe加载
             iframe = self.page.frame_locator("iframe").first
             total_element = iframe.locator("text=为您找到相关结果约")
             text = await total_element.text_content()
@@ -144,10 +152,7 @@ class StdCrawler:
         results = []
 
         try:
-            # 获取iframe
             iframe = self.page.frame_locator("iframe").first
-
-            # 获取所有结果项
             items = iframe.locator("table").filter(has=iframe.locator("a[href*='Detailed']"))
             count = await items.count()
 
@@ -155,7 +160,6 @@ class StdCrawler:
                 try:
                     item = items.nth(i)
 
-                    # 获取标准链接和标题
                     link_element = item.locator("a[href*='Detailed']").first
                     title = await link_element.text_content()
                     href = await link_element.get_attribute("href")
@@ -163,12 +167,10 @@ class StdCrawler:
                     if not title or not href:
                         continue
 
-                    # 解析标准信息
                     result = self._parse_title(title.strip())
                     result["url"] = href if href.startswith("http") else f"{self.BASE_URL}{href}"
                     result["title"] = title.strip()
 
-                    # 获取状态
                     try:
                         status_element = item.locator("td").last
                         status = await status_element.text_content()
@@ -178,7 +180,7 @@ class StdCrawler:
 
                     results.append(result)
 
-                except Exception as e:
+                except Exception:
                     continue
 
         except Exception as e:
@@ -187,17 +189,12 @@ class StdCrawler:
         return results
 
     def _parse_title(self, title: str) -> dict:
-        """解析标准标题，提取编号和名称"""
+        """解析标准标题"""
+        title = re.sub(r'\s+', ' ', title).strip()
         parts = title.split(" ", 1)
         if len(parts) == 2:
-            return {
-                "std_code": parts[0],
-                "std_name": parts[1]
-            }
-        return {
-            "std_code": "",
-            "std_name": title
-        }
+            return {"std_code": parts[0], "std_name": parts[1]}
+        return {"std_code": "", "std_name": title}
 
     async def _has_next_page(self) -> bool:
         """检查是否有下一页"""
@@ -220,15 +217,7 @@ class StdCrawler:
             print(f"翻页失败: {e}")
 
     async def get_detail(self, url: str) -> dict:
-        """
-        获取标准详情
-
-        Args:
-            url: 标准详情页URL
-
-        Returns:
-            标准详情信息
-        """
+        """获取标准详情"""
         detail = {}
 
         try:
@@ -236,34 +225,106 @@ class StdCrawler:
             await self.page.wait_for_load_state("networkidle")
             await asyncio.sleep(1)
 
-            # 获取详情页内容
-            content = await self.page.content()
+            # 获取标准名称
+            try:
+                cn_title = await self.page.locator("h4").first.text_content()
+                detail["cn_title"] = cn_title.strip() if cn_title else ""
+            except:
+                pass
 
-            # 解析基本信息
-            info_items = await self.page.locator("tr").all()
-            for item in info_items:
-                try:
-                    cells = await item.locator("td").all()
-                    if len(cells) >= 2:
-                        key = await cells[0].text_content()
-                        value = await cells[1].text_content()
+            try:
+                en_title = await self.page.locator("h5").first.text_content()
+                detail["en_title"] = en_title.strip() if en_title else ""
+            except:
+                pass
+
+            # 获取基础信息
+            try:
+                terms = await self.page.locator("dt").all()
+                definitions = await self.page.locator("dd").all()
+
+                for i, term in enumerate(terms):
+                    if i < len(definitions):
+                        key = await term.text_content()
+                        value = await definitions[i].text_content()
                         if key and value:
-                            detail[key.strip().replace("：", "")] = value.strip()
-                except:
-                    continue
+                            key = key.strip().replace("：", "").replace(":", "")
+                            value = value.strip()
+                            detail[key] = value
+            except:
+                pass
+
+            # 获取起草单位
+            try:
+                paragraph = await self.page.locator("p:has-text('主要起草单位')").text_content()
+                if paragraph:
+                    units = paragraph.replace("主要起草单位", "").strip()
+                    detail["起草单位"] = units
+            except:
+                pass
+
+            # 获取起草人
+            try:
+                paragraph = await self.page.locator("p:has-text('主要起草人')").text_content()
+                if paragraph:
+                    persons = paragraph.replace("主要起草人", "").strip()
+                    detail["起草人"] = persons
+            except:
+                pass
+
+            # 获取PDF下载链接
+            pdf_info = await self._get_pdf_link()
+            if pdf_info:
+                detail.update(pdf_info)
 
         except Exception as e:
             print(f"获取详情失败: {e}")
 
         return detail
 
-    def save_to_csv(self, filename: str = None):
-        """
-        保存结果到CSV文件
+    async def _get_pdf_link(self) -> dict:
+        """获取标准PDF下载链接"""
+        pdf_info = {}
 
-        Args:
-            filename: 文件名，默认使用时间戳
-        """
+        try:
+            view_text_btn = self.page.locator("text=查看文本").first
+            if await view_text_btn.count() > 0:
+                async with self.page.context.expect_page() as new_page_info:
+                    await view_text_btn.click()
+                    await asyncio.sleep(2)
+
+                try:
+                    new_page = await new_page_info.value
+                    await new_page.wait_for_load_state("networkidle")
+
+                    pdf_page_url = new_page.url
+                    pdf_info["pdf_page_url"] = pdf_page_url
+
+                    download_btn = new_page.locator("button:has-text('下载标准')")
+                    if await download_btn.count() > 0:
+                        pdf_info["has_pdf_download"] = True
+
+                    preview_btn = new_page.locator("button:has-text('在线预览')")
+                    if await preview_btn.count() > 0:
+                        pdf_info["has_online_preview"] = True
+
+                    hcno_match = re.search(r'hcno=([A-F0-9]+)', pdf_page_url)
+                    if hcno_match:
+                        hcno = hcno_match.group(1)
+                        pdf_info["hcno"] = hcno
+                        pdf_info["pdf_download_url"] = f"https://openstd.samr.gov.cn/bzgk/std/downLoadView?hcno={hcno}"
+
+                    await new_page.close()
+                except:
+                    pass
+
+        except Exception:
+            pass
+
+        return pdf_info
+
+    def save_to_csv(self, filename: str = None):
+        """保存结果到CSV文件"""
         if not self.results:
             print("没有数据可保存")
             return
@@ -274,7 +335,6 @@ class StdCrawler:
 
         filepath = Path(filename)
 
-        # 获取所有字段
         fieldnames = set()
         for result in self.results:
             fieldnames.update(result.keys())
@@ -288,12 +348,7 @@ class StdCrawler:
         print(f"数据已保存到: {filepath.absolute()}")
 
     def save_to_json(self, filename: str = None):
-        """
-        保存结果到JSON文件
-
-        Args:
-            filename: 文件名，默认使用时间戳
-        """
+        """保存结果到JSON文件"""
         if not self.results:
             print("没有数据可保存")
             return
@@ -312,48 +367,32 @@ class StdCrawler:
 
 async def main():
     """主函数 - 使用示例"""
-    # 创建爬虫实例
-    crawler = StdCrawler(
-        headless=True,   # 无头模式（不显示浏览器窗口）
-        delay=1.5        # 请求间隔1.5秒
-    )
+    crawler = StdCrawler(headless=True, delay=1.5)
 
     try:
-        # 启动浏览器
         await crawler.start()
 
-        # 搜索标准
-        # 你可以修改以下参数：
-        # - keyword: 搜索关键词
-        # - max_pages: 最大爬取页数
-        # - std_type: 标准类型 (全部/国家标准计划/国家标准/行业标准/地方标准)
-        # - std_status: 标准状态 (全部/现行/废止)
-
-        results = await crawler.search(
-            keyword="食品安全",     # 搜索关键词
-            max_pages=3,            # 爬取3页
-            std_type="全部",        # 所有类型
-            std_status="全部"       # 所有状态
+        # 批量搜索多个关键词
+        keywords = ["安全生产", "接地标准"]
+        results = await crawler.batch_search(
+            keywords=keywords,
+            max_pages=2,
+            get_details=True
         )
 
-        # 打印结果预览
         print("\n=== 结果预览 ===")
         for i, result in enumerate(results[:5], 1):
             print(f"{i}. {result.get('std_code', '')} - {result.get('std_name', '')}")
-            print(f"   状态: {result.get('status', '')} | URL: {result.get('url', '')}")
+            print(f"   状态: {result.get('status', '')} | 关键词: {result.get('search_keyword', '')}")
+            if result.get('pdf_page_url'):
+                print(f"   PDF页面: {result.get('pdf_page_url', '')}")
 
-        if len(results) > 5:
-            print(f"... 还有 {len(results) - 5} 条记录")
-
-        # 保存结果
-        crawler.save_to_csv()   # 保存为CSV
-        crawler.save_to_json()  # 保存为JSON
+        crawler.save_to_csv()
+        crawler.save_to_json()
 
     finally:
-        # 关闭浏览器
         await crawler.close()
 
 
 if __name__ == "__main__":
-    # 运行爬虫
     asyncio.run(main())

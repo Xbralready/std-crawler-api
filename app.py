@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FastAPI 后端服务
+FastAPI 后端服务 v2.0
+新增：批量搜索、详情获取、PDF链接
 """
 
 import asyncio
@@ -9,7 +10,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -18,8 +19,8 @@ from std_crawler import StdCrawler
 
 app = FastAPI(
     title="标准信息爬虫 API",
-    description="全国标准信息公共服务平台爬虫接口",
-    version="1.0.0"
+    description="全国标准信息公共服务平台爬虫接口 v2.0",
+    version="2.0.0"
 )
 
 # 配置CORS
@@ -35,7 +36,7 @@ app.add_middleware(
 tasks_status = {}
 
 # 数据存储目录
-DATA_DIR = Path(__file__).parent.parent / "data"
+DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 
@@ -45,6 +46,16 @@ class SearchRequest(BaseModel):
     max_pages: int = 3
     std_type: str = "全部"
     std_status: str = "全部"
+    get_details: bool = False
+
+
+class BatchSearchRequest(BaseModel):
+    """批量搜索请求参数"""
+    keywords: List[str]
+    max_pages: int = 2
+    std_type: str = "全部"
+    std_status: str = "全部"
+    get_details: bool = False
 
 
 class TaskResponse(BaseModel):
@@ -59,9 +70,10 @@ async def root():
     """API根路径"""
     return {
         "name": "标准信息爬虫 API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "search": "/api/search",
+            "batch_search": "/api/batch-search",
             "status": "/api/status/{task_id}",
             "results": "/api/results/{task_id}",
             "download": "/api/download/{task_id}"
@@ -71,31 +83,29 @@ async def root():
 
 @app.post("/api/search", response_model=TaskResponse)
 async def start_search(request: SearchRequest, background_tasks: BackgroundTasks):
-    """
-    启动爬取任务
-    """
-    # 生成任务ID
+    """启动单关键词爬取任务"""
     task_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 初始化任务状态
     tasks_status[task_id] = {
         "status": "running",
         "progress": 0,
         "message": "正在启动爬虫...",
         "keyword": request.keyword,
+        "keywords": [request.keyword],
         "results": [],
         "total": 0,
-        "created_at": datetime.now().isoformat()
+        "created_at": datetime.now().isoformat(),
+        "get_details": request.get_details
     }
 
-    # 后台执行爬取任务
     background_tasks.add_task(
         run_crawler,
         task_id,
-        request.keyword,
+        [request.keyword],
         request.max_pages,
         request.std_type,
-        request.std_status
+        request.std_status,
+        request.get_details
     )
 
     return TaskResponse(
@@ -105,25 +115,62 @@ async def start_search(request: SearchRequest, background_tasks: BackgroundTasks
     )
 
 
-async def run_crawler(task_id: str, keyword: str, max_pages: int,
-                      std_type: str, std_status: str):
-    """
-    执行爬取任务
-    """
+@app.post("/api/batch-search", response_model=TaskResponse)
+async def start_batch_search(request: BatchSearchRequest, background_tasks: BackgroundTasks):
+    """启动批量搜索任务"""
+    task_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    keywords_str = ", ".join(request.keywords[:3])
+    if len(request.keywords) > 3:
+        keywords_str += f" 等{len(request.keywords)}个"
+
+    tasks_status[task_id] = {
+        "status": "running",
+        "progress": 0,
+        "message": f"正在批量搜索: {keywords_str}",
+        "keyword": keywords_str,
+        "keywords": request.keywords,
+        "results": [],
+        "total": 0,
+        "created_at": datetime.now().isoformat(),
+        "get_details": request.get_details
+    }
+
+    background_tasks.add_task(
+        run_crawler,
+        task_id,
+        request.keywords,
+        request.max_pages,
+        request.std_type,
+        request.std_status,
+        request.get_details
+    )
+
+    return TaskResponse(
+        task_id=task_id,
+        status="running",
+        message=f"批量爬取任务已启动，共 {len(request.keywords)} 个关键词"
+    )
+
+
+async def run_crawler(task_id: str, keywords: List[str], max_pages: int,
+                      std_type: str, std_status: str, get_details: bool):
+    """执行爬取任务"""
     crawler = StdCrawler(headless=True, delay=1.5)
 
     try:
         tasks_status[task_id]["message"] = "正在启动浏览器..."
         await crawler.start()
 
-        tasks_status[task_id]["message"] = f"正在搜索: {keyword}"
+        tasks_status[task_id]["message"] = f"正在搜索 {len(keywords)} 个关键词..."
 
-        # 执行搜索
-        results = await crawler.search(
-            keyword=keyword,
+        # 使用批量搜索
+        results = await crawler.batch_search(
+            keywords=keywords,
             max_pages=max_pages,
             std_type=std_type,
-            std_status=std_status
+            std_status=std_status,
+            get_details=get_details
         )
 
         # 更新任务状态
@@ -150,9 +197,7 @@ async def run_crawler(task_id: str, keyword: str, max_pages: int,
 
 @app.get("/api/status/{task_id}")
 async def get_task_status(task_id: str):
-    """
-    获取任务状态
-    """
+    """获取任务状态"""
     if task_id not in tasks_status:
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -163,15 +208,15 @@ async def get_task_status(task_id: str):
         "progress": task["progress"],
         "message": task["message"],
         "total": task.get("total", 0),
-        "keyword": task.get("keyword", "")
+        "keyword": task.get("keyword", ""),
+        "keywords": task.get("keywords", []),
+        "get_details": task.get("get_details", False)
     }
 
 
 @app.get("/api/results/{task_id}")
 async def get_task_results(task_id: str, page: int = 1, page_size: int = 20):
-    """
-    获取爬取结果
-    """
+    """获取爬取结果"""
     if task_id not in tasks_status:
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -197,9 +242,7 @@ async def get_task_results(task_id: str, page: int = 1, page_size: int = 20):
 
 @app.get("/api/download/{task_id}")
 async def download_results(task_id: str, format: str = "json"):
-    """
-    下载爬取结果
-    """
+    """下载爬取结果"""
     if task_id not in tasks_status:
         raise HTTPException(status_code=404, detail="任务不存在")
 
@@ -226,7 +269,11 @@ async def download_results(task_id: str, format: str = "json"):
         filepath = DATA_DIR / filename
 
         if results:
-            fieldnames = list(results[0].keys())
+            fieldnames = set()
+            for r in results:
+                fieldnames.update(r.keys())
+            fieldnames = sorted(list(fieldnames))
+
             with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -244,20 +291,19 @@ async def download_results(task_id: str, format: str = "json"):
 
 @app.get("/api/history")
 async def get_history():
-    """
-    获取历史任务列表
-    """
+    """获取历史任务列表"""
     history = []
     for task_id, task in tasks_status.items():
         history.append({
             "task_id": task_id,
             "keyword": task.get("keyword", ""),
+            "keywords": task.get("keywords", []),
             "status": task["status"],
             "total": task.get("total", 0),
-            "created_at": task.get("created_at", "")
+            "created_at": task.get("created_at", ""),
+            "get_details": task.get("get_details", False)
         })
 
-    # 按时间倒序排列
     history.sort(key=lambda x: x["created_at"], reverse=True)
     return {"history": history}
 
