@@ -38,7 +38,7 @@ class StdCrawler:
         playwright = await async_playwright().start()
         self.browser = await playwright.chromium.launch(headless=self.headless)
         self.page = await self.browser.new_page()
-        self.page.set_default_timeout(30000)
+        self.page.set_default_timeout(60000)  # 增加到60秒
         print("浏览器已启动")
 
     async def close(self):
@@ -65,13 +65,16 @@ class StdCrawler:
             )
 
             if get_details and results:
-                print(f"正在获取 {len(results)} 条记录的详情...")
-                for j, result in enumerate(results):
+                # 限制详情获取数量，避免过多请求
+                max_details = min(len(results), 20)
+                print(f"正在获取 {max_details} 条记录的详情（共 {len(results)} 条）...")
+                for j, result in enumerate(results[:max_details]):
                     if result.get("url"):
-                        print(f"  [{j+1}/{len(results)}] 获取详情: {result.get('std_code', '')}")
+                        print(f"  [{j+1}/{max_details}] 获取详情: {result.get('std_code', '')}")
                         detail = await self.get_detail(result["url"])
                         result.update(detail)
-                        await asyncio.sleep(self.delay * 0.5)
+                        # 增加延迟避免被限流
+                        await asyncio.sleep(self.delay + random.uniform(0.5, 1.5))
 
             for result in results:
                 result["search_keyword"] = keyword
@@ -216,69 +219,82 @@ class StdCrawler:
         except Exception as e:
             print(f"翻页失败: {e}")
 
-    async def get_detail(self, url: str) -> dict:
-        """获取标准详情"""
+    async def get_detail(self, url: str, retry_count: int = 2) -> dict:
+        """获取标准详情，支持重试"""
         detail = {}
 
-        try:
-            await self.page.goto(url)
-            await self.page.wait_for_load_state("networkidle")
-            await asyncio.sleep(1)
-
-            # 获取标准名称
+        for attempt in range(retry_count + 1):
             try:
-                cn_title = await self.page.locator("h4").first.text_content()
-                detail["cn_title"] = cn_title.strip() if cn_title else ""
-            except:
-                pass
+                # 使用较长超时，只等待domcontentloaded而非完整加载
+                await self.page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)  # 等待页面渲染
 
-            try:
-                en_title = await self.page.locator("h5").first.text_content()
-                detail["en_title"] = en_title.strip() if en_title else ""
-            except:
-                pass
+                # 获取标准名称
+                try:
+                    cn_title = await self.page.locator("h4").first.text_content(timeout=5000)
+                    detail["cn_title"] = cn_title.strip() if cn_title else ""
+                except:
+                    pass
 
-            # 获取基础信息
-            try:
-                terms = await self.page.locator("dt").all()
-                definitions = await self.page.locator("dd").all()
+                try:
+                    en_title = await self.page.locator("h5").first.text_content(timeout=5000)
+                    detail["en_title"] = en_title.strip() if en_title else ""
+                except:
+                    pass
 
-                for i, term in enumerate(terms):
-                    if i < len(definitions):
-                        key = await term.text_content()
-                        value = await definitions[i].text_content()
-                        if key and value:
-                            key = key.strip().replace("：", "").replace(":", "")
-                            value = value.strip()
-                            detail[key] = value
-            except:
-                pass
+                # 获取基础信息
+                try:
+                    terms = await self.page.locator("dt").all()
+                    definitions = await self.page.locator("dd").all()
 
-            # 获取起草单位
-            try:
-                paragraph = await self.page.locator("p:has-text('主要起草单位')").text_content()
-                if paragraph:
-                    units = paragraph.replace("主要起草单位", "").strip()
-                    detail["起草单位"] = units
-            except:
-                pass
+                    for i, term in enumerate(terms):
+                        if i < len(definitions):
+                            key = await term.text_content(timeout=3000)
+                            value = await definitions[i].text_content(timeout=3000)
+                            if key and value:
+                                key = key.strip().replace("：", "").replace(":", "")
+                                value = value.strip()
+                                detail[key] = value
+                except:
+                    pass
 
-            # 获取起草人
-            try:
-                paragraph = await self.page.locator("p:has-text('主要起草人')").text_content()
-                if paragraph:
-                    persons = paragraph.replace("主要起草人", "").strip()
-                    detail["起草人"] = persons
-            except:
-                pass
+                # 获取起草单位
+                try:
+                    paragraph = await self.page.locator("p:has-text('主要起草单位')").text_content(timeout=5000)
+                    if paragraph:
+                        units = paragraph.replace("主要起草单位", "").strip()
+                        detail["起草单位"] = units
+                except:
+                    pass
 
-            # 获取PDF下载链接
-            pdf_info = await self._get_pdf_link()
-            if pdf_info:
-                detail.update(pdf_info)
+                # 获取起草人
+                try:
+                    paragraph = await self.page.locator("p:has-text('主要起草人')").text_content(timeout=5000)
+                    if paragraph:
+                        persons = paragraph.replace("主要起草人", "").strip()
+                        detail["起草人"] = persons
+                except:
+                    pass
 
-        except Exception as e:
-            print(f"获取详情失败: {e}")
+                # 只有成功获取到基本信息才尝试获取PDF链接
+                if detail.get("cn_title") or detail.get("标准号"):
+                    try:
+                        pdf_info = await self._get_pdf_link()
+                        if pdf_info:
+                            detail.update(pdf_info)
+                    except Exception as e:
+                        print(f"获取PDF链接失败: {e}")
+
+                # 成功获取，跳出重试循环
+                if detail:
+                    break
+
+            except Exception as e:
+                print(f"获取详情失败 (尝试 {attempt + 1}/{retry_count + 1}): {e}")
+                if attempt < retry_count:
+                    wait_time = (attempt + 1) * 3  # 递增等待时间
+                    print(f"等待 {wait_time} 秒后重试...")
+                    await asyncio.sleep(wait_time)
 
         return detail
 
