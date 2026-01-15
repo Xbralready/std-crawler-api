@@ -12,8 +12,11 @@ import re
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable
 from playwright.async_api import async_playwright, Page, Browser
+
+# 进度回调类型
+ProgressCallback = Callable[[int, str], None]
 
 
 class StdCrawler:
@@ -49,14 +52,26 @@ class StdCrawler:
 
     async def batch_search(self, keywords: List[str], max_pages: int = 3,
                            std_type: str = "全部", std_status: str = "全部",
-                           get_details: bool = False) -> List[Dict]:
+                           get_details: bool = False,
+                           progress_callback: Optional[ProgressCallback] = None) -> List[Dict]:
         """
         批量搜索多个关键词
+        progress_callback: 进度回调函数，接收 (progress_percent, message)
         """
         all_results = []
+        total_keywords = len(keywords)
+
+        def report_progress(percent: int, msg: str):
+            """报告进度"""
+            print(msg)
+            if progress_callback:
+                progress_callback(percent, msg)
 
         for i, keyword in enumerate(keywords):
-            print(f"\n[{i+1}/{len(keywords)}] 搜索关键词: {keyword}")
+            # 计算搜索阶段进度 (0-50% 用于搜索)
+            search_base = int((i / total_keywords) * 50)
+            report_progress(search_base, f"🔍 [{i+1}/{total_keywords}] 正在搜索: {keyword}")
+
             results = await self.search(
                 keyword=keyword,
                 max_pages=max_pages,
@@ -64,16 +79,23 @@ class StdCrawler:
                 std_status=std_status
             )
 
+            report_progress(search_base + 5, f"✅ [{i+1}/{total_keywords}] {keyword}: 找到 {len(results)} 条记录")
+
             if get_details and results:
-                # 限制详情获取数量，避免过多请求
+                # 详情获取阶段 (50-95%)
                 max_details = min(len(results), 20)
-                print(f"正在获取 {max_details} 条记录的详情（共 {len(results)} 条）...")
+                detail_base = 50 + int((i / total_keywords) * 45)
+
                 for j, result in enumerate(results[:max_details]):
                     if result.get("url"):
-                        print(f"  [{j+1}/{max_details}] 获取详情: {result.get('std_code', '')}")
+                        detail_progress = detail_base + int((j / max_details) * (45 / total_keywords))
+                        std_code = result.get('std_code', '未知')
+                        report_progress(
+                            detail_progress,
+                            f"📄 [{i+1}/{total_keywords}] 获取详情 ({j+1}/{max_details}): {std_code}"
+                        )
                         detail = await self.get_detail(result["url"])
                         result.update(detail)
-                        # 增加延迟避免被限流
                         await asyncio.sleep(self.delay + random.uniform(0.5, 1.5))
 
             for result in results:
@@ -85,7 +107,7 @@ class StdCrawler:
                 await asyncio.sleep(self.delay)
 
         self.results = all_results
-        print(f"\n批量搜索完成，共获取 {len(all_results)} 条记录")
+        report_progress(100, f"🎉 爬取完成！共获取 {len(all_results)} 条记录")
         return all_results
 
     async def search(self, keyword: str, max_pages: int = 5,

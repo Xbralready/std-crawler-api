@@ -158,19 +158,25 @@ async def run_crawler(task_id: str, keywords: List[str], max_pages: int,
     """执行爬取任务"""
     crawler = StdCrawler(headless=True, delay=1.5)
 
+    def update_progress(progress: int, message: str):
+        """更新任务进度"""
+        tasks_status[task_id]["progress"] = progress
+        tasks_status[task_id]["message"] = message
+
     try:
-        tasks_status[task_id]["message"] = "正在启动浏览器..."
+        update_progress(5, "🚀 正在启动浏览器...")
         await crawler.start()
 
-        tasks_status[task_id]["message"] = f"正在搜索 {len(keywords)} 个关键词..."
+        update_progress(10, f"🔍 开始搜索 {len(keywords)} 个关键词...")
 
-        # 使用批量搜索
+        # 使用批量搜索，传入进度回调
         results = await crawler.batch_search(
             keywords=keywords,
             max_pages=max_pages,
             std_type=std_type,
             std_status=std_status,
-            get_details=get_details
+            get_details=get_details,
+            progress_callback=update_progress
         )
 
         # 更新任务状态
